@@ -29,13 +29,23 @@
 #define T2_STACK_START ((SRAM_END) -(1*SIZE_TASK_STACK))
 #define T3_STACK_START ((SRAM_END) -(2*SIZE_TASK_STACK))
 #define T4_STACK_START ((SRAM_END) -(3*SIZE_TASK_STACK))
-#define SCHED_STACK_START ((SRAM_END) -(4*SIZE_TASK_STACK))
+#define IDLE_STACK_START ((SRAM_END) -(4*SIZE_TASK_STACK))
+#define SCHED_STACK_START ((SRAM_END) -(5*SIZE_TASK_STACK))
 
 #define TICK_HZ	1000U
 #define CPU_CLK 16000000U
 #define SYSTICK_CLK CPU_CLK
 
-#define NUMBEROF_TASKS 4
+#define TASK_READY_STATE 0X00
+#define TASK_BLOCKED_STATE 0XFF
+#define NUMBEROF_TASKS 5
+
+#define PENDSV_REG 0xE000ED04U
+
+#define GREEN_LED 0
+#define ORANGE_LED 1
+#define RED_LED 2
+#define BLUE_LED 3
 
 void task1(void);
 void task2(void);
@@ -47,18 +57,28 @@ __attribute((naked)) void init_scheduler_stack(uint32_t scheduleraddr);
 __attribute((naked)) void switch_to_PSP(void);
 void init_task_stacks(void);
 uint32_t get_psp_value(void);
+void task_delay(uint32_t tick_count);
+void idle_task(void);
+void update_global_tick_count(void);
+void schedule_pendsv(void);
+void init_LEDs(void);
+void turn_on_LED(uint8_t led);
+void turn_off_LED(uint8_t led);
+uint8_t current_task=1;
 
+typedef struct {
+	uint32_t psp_val;
+	uint32_t block_count;
+	uint8_t current_state;
+	void (*task_handler)(void);
+}TCB_t;
 
-uint32_t psp_of_tasks[NUMBEROF_TASKS]={T1_STACK_START,T2_STACK_START,T3_STACK_START,T4_STACK_START};
-uint32_t tasks[NUMBEROF_TASKS];
-uint8_t current_task=0;
+TCB_t user_tasks[NUMBEROF_TASKS];
+uint32_t g_tick_count=0;
 int main(void)
 {
+	init_LEDs();
 	init_scheduler_stack(SCHED_STACK_START);
-	tasks[0]=(uint32_t)task1;
-	tasks[1]=(uint32_t)task2;
-	tasks[2]=(uint32_t)task3;
-	tasks[3]=(uint32_t)task4;
 	init_task_stacks();
 	init_systick_timer(TICK_HZ);
 	switch_to_PSP();
@@ -66,18 +86,95 @@ int main(void)
 	for(;;);
 }
 
-void save_psp_value(uint32_t psp_addr)
+void init_LEDs(void)
 {
-	psp_of_tasks[current_task]=psp_addr;
+	volatile uint32_t* const pClockEnReg= (uint32_t *) ((0x40023800)+(0x30));
+	volatile uint32_t* const pGpio_D_ModeReg= (uint32_t *) (0x40020C00);
+	*pClockEnReg|=(1<<3);	//Enabling gpioD clock
+	*pGpio_D_ModeReg&=~(3<<24); //Clearing the bits for GREEN LED
+	*pGpio_D_ModeReg&=~(3<<26); //Clearing the bits for ORANGE LED
+	*pGpio_D_ModeReg&=~(3<<28); //Clearing the bits for RED LED
+	*pGpio_D_ModeReg&=~(3<<30); //Clearing the bits for BLUE LED
+	*pGpio_D_ModeReg|= (1<<24);	//Setting bit 24 (PD12) for output GREEN LED
+	*pGpio_D_ModeReg|= (1<<26);	//Setting bit 26 (PD13) for output ORANGE LED
+	*pGpio_D_ModeReg|= (1<<28);	//Setting bit 28 (PD14)for output RED LED
+	*pGpio_D_ModeReg|= (1<<30);	//Setting bit 30 (PD15)for output BLUE LED
 }
+
+void turn_on_LED(uint8_t led)
+{
+	volatile uint32_t* const pGpio_D_OutputReg= (uint32_t *) ((0x40020C00)+(0x14));
+	*pGpio_D_OutputReg|=(1<<(12+led));
+}
+void turn_off_LED(uint8_t led)
+{
+	volatile uint32_t* const pGpio_D_OutputReg= (uint32_t *) ((0x40020C00)+(0x14));
+	*pGpio_D_OutputReg&=~(1<<(12+led));
+}
+
 
 void set_next_task(void)
 {
-	++current_task;
-	current_task%=NUMBEROF_TASKS;
+	int state=TASK_BLOCKED_STATE;
+	for(int i=0;i<(NUMBEROF_TASKS);i++)
+	{
+		current_task++;
+		current_task%=NUMBEROF_TASKS;
+		state=user_tasks[current_task].current_state;
+		if((state==TASK_READY_STATE)&&(current_task!=0))
+		{
+			break;
+		}
+	}
+	if(state!=TASK_READY_STATE)
+	{
+		current_task=0;
+	}
 }
 
-__attribute((naked)) void SysTick_Handler(void)
+
+
+void update_global_tick_count(void)
+{
+	volatile uint32_t val=(uint32_t)0xDFFFFFFFF;
+	if(g_tick_count==val)
+	{
+		volatile uint32_t subt=(uint32_t)0xBFFFFFFFF;
+		g_tick_count-=subt;
+		for(int i=1;i<NUMBEROF_TASKS;i++)
+		{
+			user_tasks[i].block_count-=subt;
+		}
+		g_tick_count++;
+	}
+	else
+	{
+		g_tick_count++;
+	}
+}
+
+void unblock_tasks(void)
+{
+	for(int i=1;i<NUMBEROF_TASKS;i++)
+	{
+		if(user_tasks[i].current_state!=TASK_READY_STATE)
+		{
+			if(user_tasks[i].block_count<=g_tick_count)
+			{
+				user_tasks[i].current_state=TASK_READY_STATE;
+			}
+		}
+	}
+}
+
+void SysTick_Handler(void)
+{
+	update_global_tick_count();
+	unblock_tasks();
+	schedule_pendsv();
+}
+
+__attribute((naked)) void PendSV_Handler(void)
 {
 	__asm volatile ("MRS R0,PSP");		//saving the current value of the PSP
 	__asm volatile ("STMDB R0!,{R4-R11}");	//saving the remaining piece of the stack frame
@@ -96,12 +193,15 @@ __attribute((naked)) void SysTick_Handler(void)
 	__asm volatile ("POP {LR}");
 
 	__asm volatile ("BX LR");		//return to main
-
 }
 
 uint32_t get_psp_value(void)
 {
-	return psp_of_tasks[current_task];
+	return user_tasks[current_task].psp_val;
+}
+void save_psp_value(uint32_t psp_addr)
+{
+	user_tasks[current_task].psp_val=psp_addr;
 }
 
 __attribute((naked)) void switch_to_PSP(void)
@@ -119,14 +219,33 @@ __attribute((naked)) void switch_to_PSP(void)
 
 void init_task_stacks(void)
 {
+
+	user_tasks[0].current_state=TASK_READY_STATE;
+	user_tasks[1].current_state=TASK_READY_STATE;
+	user_tasks[2].current_state=TASK_READY_STATE;
+	user_tasks[3].current_state=TASK_READY_STATE;
+	user_tasks[4].current_state=TASK_READY_STATE;
+
+	user_tasks[0].psp_val=IDLE_STACK_START;
+	user_tasks[1].psp_val=T1_STACK_START;
+	user_tasks[2].psp_val=T2_STACK_START;
+	user_tasks[3].psp_val=T3_STACK_START;
+	user_tasks[4].psp_val=T4_STACK_START;
+
+	user_tasks[0].task_handler=idle_task;
+	user_tasks[1].task_handler=task1;
+	user_tasks[2].task_handler=task2;
+	user_tasks[3].task_handler=task3;
+	user_tasks[4].task_handler=task4;
+
 	uint32_t *pPSP;
-	for(int i=1;i<NUMBEROF_TASKS;i++)		//the stackframe of task1 will be loaded when the systick interrupt triggers
+	for(int i=0;i<NUMBEROF_TASKS;i++)		//the stackframe of task1 will be loaded when the systick interrupt triggers
 	{
-		pPSP=(uint32_t *)psp_of_tasks[i];
+		pPSP=(uint32_t *)user_tasks[i].psp_val;
 		--pPSP;
 		*pPSP=0x01000000;	//Setting xPSR register with reset value, T bit is set as 1
 		--pPSP;
-		*pPSP=tasks[i];		//Address of the function/tasks
+		*pPSP= (uint32_t)user_tasks[i].task_handler;		//Address of the function/tasks
 		--pPSP;
 		*pPSP=0xFFFFFFFD;	//Loading LR with exception return to handler mode that returns with PSP as SP
 		for(int k=0;k<13;k++)
@@ -134,7 +253,7 @@ void init_task_stacks(void)
 			--pPSP;
 			*pPSP=0;
 		}
-		psp_of_tasks[i]=(uint32_t)pPSP;			//
+		user_tasks[i].psp_val=(uint32_t)pPSP;			//
 	}
 }
 
@@ -159,18 +278,40 @@ void init_systick_timer(uint32_t tickHz)
 }
 
 
+void schedule_pendsv(void)
+{
+	uint32_t *pICSR=(uint32_t*)PENDSV_REG;
+	*pICSR|=(1<<28);
+}
+
+void task_delay(uint32_t tick_count)
+{
+	if(current_task)
+	{
+	user_tasks[current_task].block_count= g_tick_count + tick_count;
+	user_tasks[current_task].current_state= TASK_BLOCKED_STATE;
+	schedule_pendsv();
+	}
+}
+
 void task1(void)
 {
 	while(1)
 	{
-		printf("This is task 1 \n");
+		turn_on_LED(GREEN_LED);
+		task_delay(500);
+		turn_off_LED(GREEN_LED);
+		task_delay(500);
 	}
 }
 void task2(void)
 {
 	while(1)
 	{
-		printf("This is task 2 \n");
+		turn_on_LED(ORANGE_LED);
+		task_delay(1000);
+		turn_off_LED(ORANGE_LED);
+		task_delay(1000);
 	}
 }
 
@@ -178,7 +319,10 @@ void task3(void)
 {
 	while(1)
 	{
-		printf("This is task 3 \n");
+		turn_on_LED(RED_LED);
+		task_delay(2000);
+		turn_off_LED(RED_LED);
+		task_delay(2000);
 	}
 }
 
@@ -186,9 +330,22 @@ void task4(void)
 {
 	while(1)
 	{
-		printf("This is task 4 \n");
+		turn_on_LED(BLUE_LED);
+		task_delay(250);
+		turn_off_LED(BLUE_LED);
+		task_delay(250);
 	}
 }
+
+void idle_task(void)
+{
+	while(1)
+	{
+
+	}
+}
+
+
 
 
 
